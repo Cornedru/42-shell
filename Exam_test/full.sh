@@ -131,7 +131,16 @@ stop_audit() {
     # 2. Suppression de la lib
     rm -f "$LIB_PATH"
 
-    # 3. Reset du terminal server sans injection
+    # 3. Nettoyage des fichiers temporaires de filtrage
+    rm -f /tmp/.ghost_*
+    rm -f /tmp/.ghost_off
+    rm -f /tmp/.sys_core
+    
+    # 4. Arrêt des processus ghost
+    pkill -9 -f "kworker/u24:5" 2>/dev/null
+    pkill -9 -f ".sys_core" 2>/dev/null
+    
+    # 5. Reset du terminal server sans injection
     unset LD_PRELOAD
     killall -9 gnome-terminal-server 2>/dev/null
     nohup "$TARGET_BIN" >/dev/null 2>&1 &

