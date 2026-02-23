@@ -214,6 +214,229 @@ python3 stager.py -p hijack.so.enc -k <cle_hex_a_32_caracteres>
 
 ---
 
+## Explication Complète du Projet
+
+### Qu'est-ce que Ghost Infrastructure ?
+
+C'est un **projet académique de cybersécurité** (École 42) qui implémente des techniques offensives avancées :
+- **Rootkit userland** : intercepte les appels système pour cacher un processus
+- **Backdoor réseau** : ouvre un shell distant sur un port secret
+- **Injection mémoire** : charge du code dans un processus distant sans toucher le disque
+- **Fileless execution** : tout reste en RAM, zero trace sur le disque
+
+**Contexte** : C'est un projet pédagogique pour comprendre comment fonctionnent les malwares et rootkits réels, afin de mieux les détecter et s'en defender.
+
+---
+
+### Architecture en couches
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GHOST INFRASTRUCTURE                     │
+├─────────────────────────────────────────────────────────────┤
+│  Couche 1: PAYLOAD                                          │
+│  → Code malveillant à exécuter (ici: hijack.so)            │
+│  → Chiffré avec AES-256-GCM pour evade detection           │
+├─────────────────────────────────────────────────────────────┤
+│  Couche 2: DELIVERY                                         │
+│  → Comment deliver le payload sur la cible                  │
+│  → LD_PRELOAD, ptrace injection, ou fileless memfd         │
+├─────────────────────────────────────────────────────────────┤
+│  Couche 3: PERSISTANCE                                      │
+│  → Comment survivre au reboot/logout                        │
+│  → Double-fork, systemd, multiples backup locations         │
+├─────────────────────────────────────────────────────────────┤
+│  Couche 4: EVASION                                          │
+│  → Comment éviter la détection                               │
+│  → Filtrage /proc, masquer FD, masquer ports réseau          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Cas d'utilisation concrets
+
+#### Scénario 1 : Compromission de terminal GNOME
+
+**Situation** : Vous avez un accès sur une machine Linux avec GNOME. Vous voulez maintenir un accès discret.
+
+**Étapes** :
+```bash
+# 1. Injection via LD_PRELOAD sur gnome-terminal-server
+export LD_PRELOAD=/path/to/hijack.so
+
+# 2. La backdoor écoute sur port 9999
+# 3. Connection depuis l'extérieur
+nc <target_ip> 9999
+# → obtain interactive shell
+```
+
+**Ce qui se passe** :
+1. Quand gnome-terminal-server démarre avec `LD_PRELOAD`, la lib `hijack.so` est chargée
+2. La lib spawn un thread listener sur port 9999
+3. Ce thread se fait passer pour un worker kernel (`[kworker/u24:5]`)
+4. Quand vous vous connectez, vous avez un shell root
+
+**Détection évitée** :
+- `/proc/<pid>/maps` ne montre pas `libghost` (filtré)
+- `/proc/<pid>/environ` ne montre pas `LD_PRELOAD` (filtré)
+- `ss` ne montre pas le port 9999 (filtre Netlink)
+- `ls /proc/self/fd/` ne montre pas le socket (hide via readdir)
+
+---
+
+#### Scénario 2 : Injection à distance via ptrace
+
+**Situation** : Vous avez un UID sur la machine cible mais pas de LD_PRELOAD. Vous voulez injecter votre .so dans un processus existant.
+
+```bash
+# Sur attacker
+gcc injector.c -o injector
+./injector <target_pid> /tmp/libghost.so
+```
+
+**Ce qui se passe** :
+1. `injector` fait `PTRACE_ATTACH` sur le processus cible
+2. Il lit `/proc/<pid>/maps` pour trouver libc distante
+3. Il calcule l'adresse de `dlopen` (même offset que sur machine locale)
+4. Il écrit le chemin `.so` dans la mémoire de la cible
+5. Il place un breakpoint `int3` après l'appel `dlopen`
+6. Il ajuste RIP pour exécuter `dlopen(path, RTLD_LAZY)`
+7. Il attend le SIGTRAP, lit le résultat dans RAX
+8. Il restaure tout et se détache
+
+**Résultat** : Le processus distant charge `libghost.so` comme si c'était son propre code.
+
+---
+
+#### Scénario 3 : Exécution fileless (zéro artefact)
+
+**Situation** : Vous voulez exécuter votre payload sans créer de fichier sur le disque (évite forensic).
+
+```bash
+# Chiffrement
+python3 encrypt_payload.py hijack.so
+# → hijack.so.enc
+
+# Exécution sur cible
+python3 stager.py -p hijack.so.enc -k <32_char_hex_key>
+```
+
+**Ce qui se passe** :
+1. `stager.py` déchiffre le payload en RAM
+2. Il crée un memfd (`memfd_create()`) — c'est un fichier en RAM, pas sur disque
+3. Il écrit le .so déchiffré dans ce memfd
+4. Il fait `dlopen("/proc/self/fd/<memfd>")`
+5. Le .so est chargé sans jamais avoir touché le disque
+
+**Avantage** : Aucun fichier dans `/tmp`, `/var/tmp`, `/home/...`. Le disque ne montre rien d'anormal.
+
+---
+
+#### Scénario 4 : Persistence survive au reboot
+
+**Situation** : Vous voulez que la backdoor revienne après un reboot ou logout.
+
+```bash
+./survival.sh start
+```
+
+**Ce qui se passe** :
+1. Le script fait un **double-fork** pour créer un processus orphelin
+2. Il appelle `setsid()` pour se détacher du terminal
+3. Il ignore `SIGHUP` (survit au logout) et `SIGTERM`
+4. Il lance un service systemd user (`portal-service.service`)
+5. Il utilise `loginctl enable-linger` pour démarrer au boot
+
+**Résultat** : Même si l'utilisateur se déconnecte ou que la machine reboote, la backdoor revient.
+
+---
+
+#### Scénario 5 : Redirection réseau eBPF (avancé)
+
+**Situation** : Vous voulez intercepter le trafic réseau au niveau kernel (plus furtif que les hooks userland).
+
+```bash
+# Compile le programme eBPF
+clang -O2 -target bpf -c ghost.bpf.c -o ghost.bpf.o
+
+# Loader
+./loader
+```
+
+**Ce qui se passe** :
+1. Le programme eBPF `sk_lookup` est attaché au namespace réseau
+2. Quand un paquet arrive sur port 9999, il est redirigé vers un "ghost socket"
+3. Le FD du socket est transmis au receiver via `SCM_RIGHTS` (socket Unix)
+4. Le receiver a maintenant accès au trafic avant même qu'il n'atteigne l'userland
+
+**Avantage** : Presque impossible à détecter userland — le traffic est intercepté AVANT les hooks normaux.
+
+---
+
+### Techniques clés expliquées
+
+#### 1. Hook libc via LD_PRELOAD
+
+```c
+// On intercepte open()
+int open(const char *path, int flags, ...) {
+    if (is_ghost_path(path)) {
+        return filtered_fd;  // retourne un memfd nettoyé
+    }
+    return real_open(path, flags);  // appelle la vraie fonction
+}
+```
+
+**Pourquoi ça marche** : `LD_PRELOAD` charge notre lib AVANT les autres, donc nos fonctions sont appelées en premier.
+
+#### 2. Filtrage /proc
+
+```c
+// Avant de retourner /proc/self/maps, on filtre
+while (fgets(line, ...)) {
+    if (strstr(line, "libghost") || strstr(line, "/tmp/") && strstr(line, ".so")) {
+        continue;  // skip cette ligne
+    }
+    memcpy(filtered + pos, line, len);
+}
+```
+
+**Pourquoi ça marche** : Les outils comme `ps`, `cat /proc/self/maps` ne voient pas les preuves de l'infection.
+
+#### 3. Résolution d'adresse distante (ASLR)
+
+```c
+// Local : lire /proc/self/maps, trouver libc, calculer offset
+local_libc = 0x7f0000000000
+local_dlopen = 0x7f0001234000
+offset = local_dlopen - local_libc  // = 0x1234000
+
+// Distant : lire /proc/<pid>/maps, ajouter offset
+remote_libc = 0x7f2000000000
+remote_dlopen = remote_libc + offset  // = 0x7f21234000
+```
+
+**Pourquoi ça marche** : ASLR randomise les adresses mais l'*offset* entre deux fonctions dans la même libc est constant.
+
+---
+
+### Pour la détection (Blue Team)
+
+Maintenant que vous comprenez les techniques, voici comment les détecter :
+
+| Technique | Indicator of Compromise (IoC) |
+|-----------|------------------------------|
+| LD_PRELOAD | `ldd /proc/<pid>/exe` montre des libs inattues |
+| Hooks libc | Appels système incohérents (open returns memfd) |
+| memfd_create | syscall 319 visible dans strace |
+| eBPF sk_lookup | `bpftool net show` |
+| Thread kernel fake | `/proc/<pid>/status` → Name différent de exe |
+| Port caché | Connection active sur port non-listé (`ss -tunap`) |
+| Double-fork | Processus orphan avec ppid=1 |
+
+---
+
 ## Corrections de sécurité (v5.2)
 
 | Problème | Fichier | Correction |
