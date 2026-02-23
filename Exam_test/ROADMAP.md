@@ -267,4 +267,3 @@ Pour un projet de ce type, les tests seraient :
 
 ---
 
-*Document généré automatiquement — Ghost Infrastructure v5.1*
