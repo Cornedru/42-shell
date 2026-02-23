@@ -133,7 +133,7 @@
 
 ```bash
 # Configuration centralisée
-#  config.h pour modifier les constantes
+# 编辑 config.h pour modifier les constantes
 
 # Bibliothèque principale (backdoor + rootkit)
 gcc -fPIC -shared -o hijack.so ghost_lib.c -ldl -lpthread

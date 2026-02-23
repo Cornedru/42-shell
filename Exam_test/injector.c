@@ -40,7 +40,7 @@ static unsigned long get_libc_base(const char *maps_path) {
     unsigned long base = 0;
     
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "libc-") && strstr(line, "r-xp")) {
+        if ((strstr(line, "libc-") || strstr(line, "libc.so")) && strstr(line, "r-xp")) {
             base = parse_hex(line);
             break;
         }
@@ -64,7 +64,7 @@ static long get_remote_dlopen_addr(pid_t pid) {
         return 0;
     }
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "libc-") && strstr(line, "r-xp")) {
+        if ((strstr(line, "libc-") || strstr(line, "libc.so")) && strstr(line, "r-xp")) {
             local_libc_base = parse_hex(line);
             break;
         }
