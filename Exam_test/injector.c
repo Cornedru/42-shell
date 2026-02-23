@@ -170,23 +170,79 @@ int inject_so(pid_t pid, const char *so_path) {
         return -1;
     }
     
+    unsigned long saved_byte = 0;
+    unsigned long bp_addr = inj_addr + strlen(so_path) + 1;
+    bp_addr = (bp_addr + 7) & ~7;
+    
+    errno = 0;
+    saved_byte = ptrace(PTRACE_PEEKTEXT, pid, bp_addr, NULL);
+    if (errno != 0) {
+        fprintf(stderr, "Failed to save byte at breakpoint address\n");
+        ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return -1;
+    }
+    
+    unsigned long int3 = (saved_byte & ~0xff) | 0xcc;
+    if (ptrace(PTRACE_POKETEXT, pid, bp_addr, int3) < 0) {
+        perror("ptrace poketext breakpoint");
+        ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return -1;
+    }
+    
     regs.rip = (unsigned long)dlopen_addr;
     regs.rdi = inj_addr;
     regs.rsi = RTLD_LAZY;
+    regs.rip = bp_addr;
     
     if (safe_ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0) {
         perror("ptrace setregs");
+        ptrace(PTRACE_POKETEXT, pid, bp_addr, saved_byte);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return -1;
     }
     
     if (safe_ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
         perror("ptrace cont");
+        ptrace(PTRACE_POKETEXT, pid, bp_addr, saved_byte);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return -1;
     }
     
-    usleep(200000);
+    int wait_status;
+    while (1) {
+        int w = waitpid(pid, &wait_status, WUNTRACED);
+        if (w < 0) {
+            perror("waitpid");
+            break;
+        }
+        if (WIFEXITED(wait_status)) {
+            fprintf(stderr, "Target process exited\n");
+            break;
+        }
+        if (WIFSIGNALED(wait_status)) {
+            fprintf(stderr, "Target process killed by signal\n");
+            break;
+        }
+        if (WIFSTOPPED(wait_status) && WSTOPSIG(wait_status) == SIGTRAP) {
+            struct user_regs_struct check_regs;
+            safe_ptrace(PTRACE_GETREGS, pid, NULL, &check_regs);
+            printf("[+] Breakpoint hit at 0x%lx\n", (unsigned long)check_regs.rip);
+            
+            long dlopen_result = check_regs.rax;
+            if (dlopen_result == 0) {
+                fprintf(stderr, "[-] dlopen returned NULL (load failed)\n");
+            } else {
+                printf("[+] dlopen succeeded, handle = 0x%lx\n", dlopen_result);
+            }
+            break;
+        }
+    }
+    
+    if (ptrace(PTRACE_POKETEXT, pid, bp_addr, saved_byte) < 0) {
+        perror("ptrace restore byte");
+    }
     
     safe_ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
     safe_ptrace(PTRACE_DETACH, pid, NULL, NULL);

